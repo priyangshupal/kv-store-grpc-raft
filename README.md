@@ -1,11 +1,12 @@
-# <img src="https://raw.githubusercontent.com/priyangshupal/documentation-images/main/grpc-raft-consensus/raft-grpc-logo.svg" alt="logo" height=45 valign="top" /> Raft-consensus protocol utilizing gRPC
+# <img src="https://raw.githubusercontent.com/priyangshupal/documentation-images/main/grpc-raft-consensus/raft-grpc-logo.svg" alt="logo" height=45 valign="top" /> Key/value store using raft-consensus protocol and gRPC
+
 <div align=center >
   <img src="https://raw.githubusercontent.com/priyangshupal/documentation-images/main/grpc-raft-consensus/grpc-raft-consensus-demo.gif" width="85%" style="box-shadow: 3px 3px 10px gray;"/>
 </div>
 
 <br />
 
-In the modern tech environment, reliability, replication, redundacy and fault tolerance hold high importance, all of which are effectively ensured by the Raft consensus protocol. However, the predominant approach in Raft consensus implementations involves the use of REST APIs. There exists a potential to optimize the performance of Raft consensus by transitioning to [gRPC](https://grpc.io/). This project provides a [Go](http://www.golang.org/) implementation of the Raft consensus protocol utilizing gRPC and subsequently evaluates its performance metrics.
+In the modern tech environment, reliability, replication, redundacy and fault tolerance hold high importance, all of which are effectively ensured by the Raft consensus protocol. However, the predominant approach in Raft consensus implementations involves the use of REST APIs. There exists a potential to optimize the performance of Raft consensus by transitioning to [gRPC](https://grpc.io/). This project provides a [Go](http://www.golang.org/) implementation of a key/value store using Raft consensus protocol utilizing gRPC for communication between Raft peers. It subsequently evaluates the performance metrics of the Raft cluster.
 
 The use cases for such a library are far-reaching, such as replicated state machines which are a key component of many distributed systems. They enable building Consistent, Partition Tolerant (CP) systems, with limited fault tolerance as well.
 
@@ -31,7 +32,7 @@ The project can be run using:
 make run
 ```
 
-This instantiates five Raft replicas, each initially assuming the role of a `follower`. Upon a timeout of the heartbeat duration of a replica, it promotes itself to a `candidate` role and requests votes from other followers. If it receives a quorum of votes, it becomes the `leader`. The client then sends operations to the cluster which are subsequently directed to the leader node. The leader then ensures that the opreations are replicated across all replicas in the cluster.
+This instantiates three key/value replicas, each with its own associated Raft peer. Initially, each raft replica will assume the role of a `follower`. Upon a timeout of the heartbeat duration of a replica, it promotes itself to a `candidate` role and requests votes from other followers. If it receives a quorum of votes, it becomes the `leader`. The client then sends operations to the cluster which are subsequently directed to the leader node. The leader then ensures that the opreations are replicated across all replicas in the cluster.
 
 ## Results
 

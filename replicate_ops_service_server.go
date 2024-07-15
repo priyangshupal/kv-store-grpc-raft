@@ -4,8 +4,8 @@ import (
 	"context"
 	"log"
 
+	"github.com/priyangshupal/grpc-raft-consensus/logfile"
 	"github.com/priyangshupal/grpc-raft-consensus/pb"
-	"github.com/priyangshupal/grpc-raft-consensus/store"
 )
 
 type ReplicateOpsServiceServer struct {
@@ -20,8 +20,9 @@ func NewReplicateOpsServiceServer(raftServer *RaftServer) *ReplicateOpsServiceSe
 func (s *ReplicateOpsServiceServer) CommitOperation(context context.Context, txn *pb.CommitTransaction) (*pb.CommitOperationResponse, error) {
 	log.Printf("[%s] received (CommitOperation: %s) from leader\n", s.raftServer.Transport.Addr(), txn.Operation)
 	logfileFinalIndex, err := s.raftServer.logfile.CommitOperation(
-		int(txn.ExpectedPreviousIndex),
-		&store.Transaction{Index: int(txn.Index), Operation: txn.Operation, Term: int(txn.Term)},
+		int(txn.ExpectedFinalIndex),
+		s.raftServer.commitIndex,
+		&logfile.Transaction{Index: int(txn.Index), Operation: txn.Operation, Term: int(txn.Term)},
 	)
 	if err != nil {
 		return nil, err
@@ -31,9 +32,12 @@ func (s *ReplicateOpsServiceServer) CommitOperation(context context.Context, txn
 
 func (s *ReplicateOpsServiceServer) ApplyOperation(context context.Context, txn *pb.ApplyOperationRequest) (*pb.ApplyOperationResponse, error) {
 	log.Printf("[%s] received (ApplyOperation) from leader\n", s.raftServer.Transport.Addr())
-	if err := s.raftServer.logfile.ApplyOperation(); err != nil {
+	appliedTxn, err := s.raftServer.logfile.ApplyOperation()
+	if err != nil {
 		return nil, err
 	}
+	s.raftServer.commitIndex++
+	s.raftServer.applyCh <- appliedTxn
 	return nil, nil
 }
 

@@ -28,7 +28,8 @@ func (s *HeartbeatServiceServer) Heartbeat(ctx context.Context, request *pb.Hear
 	// reset heartbeat timer
 	if s.raftServer.Heartbeat != nil {
 		s.raftServer.Heartbeat.Beat()
-		return nil, nil
+		return &pb.HeartbeatResponse{IsAlive: true, Addr: s.raftServer.Transport.Addr()}, nil
 	}
-	return nil, fmt.Errorf("replica not ready")
+	return &pb.HeartbeatResponse{IsAlive: true, Addr: s.raftServer.Transport.Addr()},
+		fmt.Errorf("replica not ready")
 }

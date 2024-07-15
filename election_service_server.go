@@ -21,7 +21,7 @@ func (s *ElectionServiceServer) Voting(ctx context.Context, vote *pb.VoteRequest
 	voteType := pb.VoteResponse_VOTE_REFUSED
 	// only vote if the requesting raft replica has
 	// a longer or same length logfile
-	if uint64(s.raftServer.logfile.Size()) <= vote.LogfileLength && s.raftServer.role != ROLE_LEADER {
+	if uint64(s.raftServer.commitIndex) < vote.LogfileIndex && s.raftServer.role != ROLE_LEADER {
 		voteType = pb.VoteResponse_VOTE_GIVEN
 	}
 	return &pb.VoteResponse{VoteType: voteType}, nil

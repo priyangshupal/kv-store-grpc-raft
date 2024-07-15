@@ -2,7 +2,7 @@ syntax = "proto3";
 package proto;
 option go_package = "./pb";
 
-message VoteRequest { uint64 logfile_length = 1; }
+message VoteRequest { uint64 logfile_index = 1; }
 
 message VoteResponse {
   enum VoteType {

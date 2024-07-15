@@ -1,17 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/priyangshupal/grpc-raft-consensus/encoding"
+	"github.com/priyangshupal/grpc-raft-consensus/fileops"
 	"github.com/priyangshupal/grpc-raft-consensus/heartbeat"
+	"github.com/priyangshupal/grpc-raft-consensus/logfile"
 	"github.com/priyangshupal/grpc-raft-consensus/pb"
-	"github.com/priyangshupal/grpc-raft-consensus/store"
 	"google.golang.org/grpc"
 )
 
@@ -23,33 +28,37 @@ const (
 	ROLE_CANDIDATE = 3
 )
 
-type RaftServerOpts struct {
-	ID             string
-	BootstrapNodes []string
-	Heartbeat      *heartbeat.Heartbeat
-	logfile        store.Log
-	role           ROLE
-	Transport      Transport
-}
+const (
+	HEARTBEAT_PERIOD  = time.Second * 1
+	HEARTBEAT_TIMEOUT = time.Second * 10
+)
+
+// type RaftServerOpts struct {
+// 	role           ROLE
+// 	BootstrapNodes []string
+// 	Heartbeat      *heartbeat.Heartbeat
+// 	logfile        logs.Log
+// 	Transport      Transport
+// 	applyCh        chan *logfile.Transaction
+// }
 
 type RaftServer struct {
-	RaftServerOpts
-	ReplicaConnMapLock sync.RWMutex
+	role           ROLE
+	BootstrapNodes []string
+	Heartbeat      *heartbeat.Heartbeat
+	logfile        logfile.Log
+	Transport      Transport
+	applyCh        chan *logfile.Transaction
+
+	leaderAddr  string
+	currentTerm int
+	commitIndex int
+
 	// { address of server, connection client}, we will maintain
 	// the connections and reuse them to reduce latency (creating
 	// new connections increases latency)
-	ReplicaConnMap map[string]*grpc.ClientConn
-	leaderAddr     string
-}
-
-func NewRaftServer(s RaftServerOpts) *RaftServer {
-	if len(s.ID) == 0 {
-		s.ID = uuid.NewString()
-	}
-	return &RaftServer{
-		RaftServerOpts: s,
-		ReplicaConnMap: make(map[string]*grpc.ClientConn),
-	}
+	ReplicaConnMap     map[string]*grpc.ClientConn
+	ReplicaConnMapLock sync.RWMutex
 }
 
 // Performs the operation requested by the client.
@@ -69,26 +78,14 @@ func (s *RaftServer) PerformOperation(operation string) error {
 	log.Printf("[%s] forwarding operation (%s) to leader [%s]\n", s.Transport.Addr(), operation, s.leaderAddr)
 	s.ReplicaConnMapLock.RLock()
 	defer s.ReplicaConnMapLock.RUnlock()
+
 	// sending operation to the LEADER to perform a TwoPhaseCommit
 	return sendOperationToLeader(operation, s.ReplicaConnMap[s.leaderAddr])
 }
 
-func (s *RaftServer) convertToTransaction(operation string) (*store.Transaction, error) {
+func (s *RaftServer) convertToTransaction(operation string) (*logfile.Transaction, error) {
 	// structure of operation => operationName:value... for eg: "add:5"
-	log.Printf("[%s] received operation (%s)\n", s.Transport.Addr(), operation)
-	txn, err := s.logfile.GetFinalTransaction()
-	if err != nil {
-		return nil, err
-	}
-	var index, term int
-	if txn == nil {
-		index = 1
-		term = 1
-	} else {
-		index = txn.Index + 1
-		term = txn.Term
-	}
-	return &store.Transaction{Index: index, Operation: operation, Term: term}, nil
+	return &logfile.Transaction{Index: s.commitIndex + 1, Operation: operation, Term: s.currentTerm}, nil
 }
 
 // `sendOperationToLeader` is called when an operation reaches a FOLLOWER.
@@ -106,19 +103,14 @@ func sendOperationToLeader(operation string, conn *grpc.ClientConn) error {
 }
 
 // Performs a two phase commit on all the FOLLOWERS
-func (s *RaftServer) performTwoPhaseCommit(txn *store.Transaction) error {
-	finalIndex, err := s.logfile.GetFinalIndex()
-	if err != nil {
-		return fmt.Errorf("[%s] could not fetch final transaction from Logfile: %v", s.Transport.Addr(), err)
-	}
-
+func (s *RaftServer) performTwoPhaseCommit(txn *logfile.Transaction) error {
 	s.ReplicaConnMapLock.RLock()
 	wg := &sync.WaitGroup{}
 
 	// First phase of the TwoPhaseCommit: Commit operation
 
 	// CommitOperation on self
-	if _, err := s.logfile.CommitOperation(finalIndex, txn); err != nil {
+	if _, err := s.logfile.CommitOperation(s.commitIndex, s.commitIndex, txn); err != nil {
 		panic(fmt.Errorf("[%s] %v", s.Transport.Addr(), err))
 	}
 
@@ -130,10 +122,10 @@ func (s *RaftServer) performTwoPhaseCommit(txn *store.Transaction) error {
 		response, err := replicateOpsClient.CommitOperation(
 			context.Background(),
 			&pb.CommitTransaction{
-				ExpectedPreviousIndex: int64(finalIndex),
-				Index:                 int64(txn.Index),
-				Operation:             txn.Operation,
-				Term:                  int64(txn.Term),
+				ExpectedFinalIndex: int64(s.commitIndex),
+				Index:              int64(txn.Index),
+				Operation:          txn.Operation,
+				Term:               int64(txn.Term),
 			},
 		)
 		if err != nil {
@@ -157,13 +149,13 @@ func (s *RaftServer) performTwoPhaseCommit(txn *store.Transaction) error {
 	// Second phase of the TwoPhaseCommit: Apply operation
 
 	// ApplyOperation on self
-	if err := s.logfile.ApplyOperation(); err != nil {
+	if _, err := s.logfile.ApplyOperation(); err != nil {
 		panic(err)
 	}
 
 	for _, conn := range s.ReplicaConnMap {
 		replicateOpsClient := pb.NewReplicateOperationServiceClient(conn)
-		_, err = replicateOpsClient.ApplyOperation(
+		_, err := replicateOpsClient.ApplyOperation(
 			context.Background(),
 			&pb.ApplyOperationRequest{},
 		)
@@ -172,6 +164,11 @@ func (s *RaftServer) performTwoPhaseCommit(txn *store.Transaction) error {
 		}
 	}
 	s.ReplicaConnMapLock.RUnlock()
+
+	s.commitIndex++ // increment the final commitIndex after applying changes
+
+	s.applyCh <- txn
+
 	return nil
 }
 
@@ -193,10 +190,10 @@ func (s *RaftServer) replicateMissingLogs(startIndex int, addr string, client pb
 		_, err = client.CommitOperation(
 			context.Background(),
 			&pb.CommitTransaction{
-				ExpectedPreviousIndex: int64(startIndex),
-				Index:                 int64(txn.Index),
-				Operation:             txn.Operation,
-				Term:                  int64(txn.Term),
+				ExpectedFinalIndex: int64(startIndex),
+				Index:              int64(txn.Index),
+				Operation:          txn.Operation,
+				Term:               int64(txn.Term),
 			},
 		)
 		if err != nil {
@@ -220,7 +217,7 @@ func (s *RaftServer) requestVotes() int {
 		electronServiceClient := pb.NewElectionServiceClient(conn)
 		response, err := electronServiceClient.Voting(
 			context.Background(),
-			&pb.VoteRequest{LogfileLength: uint64(s.logfile.Size())},
+			&pb.VoteRequest{LogfileIndex: uint64(s.commitIndex)},
 		)
 		if err != nil {
 			log.Printf("[%s] error while requesting vote: %v\n", s.Transport.Addr(), err)
@@ -233,32 +230,41 @@ func (s *RaftServer) requestVotes() int {
 	return numVotes
 }
 
+func (s *RaftServer) sendHeartbeat() int {
+	aliveCount := 0
+	s.ReplicaConnMapLock.RLock()
+	for addr, conn := range s.ReplicaConnMap {
+		heartbeatClient := pb.NewHeartbeatServiceClient(conn)
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*1))
+		defer cancel()
+		response, err := heartbeatClient.Heartbeat(
+			ctx,
+			&pb.HeartbeatRequest{
+				IsAlive: true,
+				Addr:    s.Transport.Addr(),
+			})
+		if err != nil {
+			log.Printf("[%s] error while sending heartbeat to [%s]: %v\n", s.Transport.Addr(), addr, err)
+		}
+		if response != nil && response.IsAlive {
+			aliveCount++
+		}
+	}
+	s.ReplicaConnMapLock.RUnlock()
+	return aliveCount
+}
+
 // `sendHeartbeatPeriodically` is called by the leader to
 // send a heartbeat to followers every second
 func (s *RaftServer) sendHeartbeatPeriodically() {
 	// start the process of sending heartbeat for a leader
 	for {
-		// if len(s.ReplicaConnMap) == 0 {
-		// 	continue
-		// }
 		log.Printf("[%s] sending heartbeat to %d followers\n", s.Transport.Addr(), len(s.ReplicaConnMap))
-		s.ReplicaConnMapLock.RLock()
-		for addr, conn := range s.ReplicaConnMap {
-			go func() {
-				heartbeatClient := pb.NewHeartbeatServiceClient(conn)
-				_, err := heartbeatClient.Heartbeat(
-					context.Background(),
-					&pb.HeartbeatRequest{
-						IsAlive: true,
-						Addr:    s.Transport.Addr(),
-					})
-				if err != nil {
-					log.Printf("[%s] error while sending heartbeat to [%s]: %v\n", s.Transport.Addr(), addr, err)
-				}
-			}()
+		aliveReplicas := s.sendHeartbeat()
+		if aliveReplicas < (len(s.ReplicaConnMap)-1)/2 {
+			panic("more than half of the replicas are down")
 		}
-		s.ReplicaConnMapLock.RUnlock()
-		time.Sleep(time.Second * 1)
+		time.Sleep(HEARTBEAT_PERIOD)
 	}
 }
 
@@ -279,6 +285,7 @@ func (s *RaftServer) startHeartbeatTimeoutProcess() error {
 			// and start sending heartbeat process
 			log.Printf("[%s] is the leader", s.Transport.Addr())
 			s.role = ROLE_LEADER
+			s.currentTerm++
 			s.leaderAddr = s.Transport.Addr()
 
 			// if the replica becomes a LEADER, it does not need to listen
@@ -296,7 +303,7 @@ func (s *RaftServer) startHeartbeatTimeoutProcess() error {
 	// start/reset heartbeat timeout process for the follower
 	// this will trigger the timeoutFunc after a timeout
 	if s.role == ROLE_FOLLOWER {
-		s.Heartbeat = heartbeat.NewHeartbeat(time.Second*10, timeoutFunc)
+		s.Heartbeat = heartbeat.NewHeartbeat(HEARTBEAT_TIMEOUT, timeoutFunc)
 	}
 	return nil
 }
@@ -340,6 +347,38 @@ func (s *RaftServer) startGrpcServer() error {
 	return nil
 }
 
+// sets the configs for a starting raftServer replica
+func makeRaftServer(addr string, applyCh chan *logfile.Transaction, nodes []string) (*RaftServer, map[string]string) {
+	raftServer := &RaftServer{
+		BootstrapNodes: nodes,
+		role:           ROLE_FOLLOWER,
+		Transport:      &GRPCTransport{ListenAddr: addr},
+		logfile:        logfile.NewLogfile(),
+		applyCh:        applyCh,
+		ReplicaConnMap: make(map[string]*grpc.ClientConn),
+	}
+
+	// check if a snapshot doesn't exists for the server,
+	// then return a new raft server
+	filePath := fmt.Sprintf("%s/%s.%s", SNAPSHOTS_DIR, addr, fileops.FILE_EXTENSION)
+	_, err := os.Stat(filePath)
+	if err != nil {
+		log.Printf("[%s] snapshot doesn't exist, creating new RaftServer", addr)
+		return raftServer, make(map[string]string)
+	}
+	log.Printf("[%s] restoring RaftServer from snapshot", addr)
+
+	// if a snapshot exists, add the additional configs to server
+	// commitIndex, logfilelength, kv map
+	snapshotContent, err := fileops.ReadFile(SNAPSHOTS_DIR, addr)
+	if err != nil {
+		log.Fatalf("error while reading snapshot: %v", err)
+	}
+	var kvMap map[string]string
+	raftServer.commitIndex, kvMap = destructureSnapshot(snapshotContent)
+	return raftServer, kvMap
+}
+
 func (s *RaftServer) Start() error {
 	go s.startGrpcServer()
 	time.Sleep(time.Second * 3) // wait for server to start
@@ -353,4 +392,20 @@ func (s *RaftServer) Start() error {
 	s.startHeartbeatTimeoutProcess()
 
 	return nil
+}
+
+func destructureSnapshot(content []byte) (int, map[string]string) {
+	// encodedCommitIndex := bytes.SplitN(content, []byte("\n"), 2)[0]
+	encodedKVMap := bytes.SplitN(content, []byte("\n"), 2)[1]
+	decodedContent, err := encoding.Decode(content)
+	if err != nil {
+		log.Fatal("error while decoding commit index", err)
+	}
+	decodedCommitIndex := strings.Trim(decodedContent, "\n")
+	decodedKVMap, err := encoding.DecodeMap(encodedKVMap)
+	if err != nil {
+		log.Fatal("error while deserializing map:", err)
+	}
+	commitIndex, _ := strconv.Atoi(decodedCommitIndex)
+	return commitIndex, decodedKVMap
 }
